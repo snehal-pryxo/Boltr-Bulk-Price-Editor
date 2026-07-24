@@ -47,6 +47,62 @@ const ACTIVE_TASK_STATUSES = [
   "Applying",
   "Cancelling",
 ];
+const SCHEDULED_LOG_PREVIEW_LIMIT = 250;
+
+const SCHEDULED_PRODUCTS_QUERY = `#graphql
+  query ScheduledTaskProducts($first: Int!, $after: String) {
+    products(first: $first, after: $after) {
+      nodes {
+        id
+        title
+        handle
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+`;
+
+const SCHEDULED_PRODUCT_NODES_QUERY = `#graphql
+  query ScheduledTaskProductNodes($ids: [ID!]!) {
+    nodes(ids: $ids) {
+      ... on Product {
+        id
+        title
+        handle
+      }
+      ... on ProductVariant {
+        id
+        title
+        product {
+          id
+          title
+          handle
+        }
+      }
+    }
+  }
+`;
+
+const SCHEDULED_COLLECTION_PRODUCTS_QUERY = `#graphql
+  query ScheduledTaskCollectionProducts($id: ID!, $first: Int!, $after: String) {
+    collection(id: $id) {
+      products(first: $first, after: $after) {
+        nodes {
+          id
+          title
+          handle
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  }
+`;
 
 export const loader = async ({ request, params }) => {
   const { admin, session } = await authenticate.admin(request);
@@ -125,6 +181,12 @@ export const loader = async ({ request, params }) => {
     shopifyStoreHandle,
     "exclude",
   );
+  const scheduledPreviewProducts = await getScheduledPreviewProducts(
+    admin,
+    task,
+    selectedApplyProducts,
+    shopifyStoreHandle,
+  );
 
   return json({
     task,
@@ -136,6 +198,7 @@ export const loader = async ({ request, params }) => {
     selectedExcludeCollections,
     selectedApplyProducts,
     selectedExcludeProducts,
+    scheduledPreviewProducts,
     productDetails: selectedProductId
       ? getProductDetails(
         task,
@@ -1705,6 +1768,227 @@ async function getSelectedProductDetails(admin, task, shopifyStoreHandle, prefix
   );
 }
 
+async function scheduledTaskGraphql(admin, query, variables = {}) {
+  if (!admin?.graphql) return null;
+
+  const response = await admin.graphql(query, { variables });
+  const payload = await response.json();
+
+  if (payload?.errors?.length) {
+    throw new Error(payload.errors.map((error) => error.message).join("; "));
+  }
+
+  return payload?.data || null;
+}
+
+function normalizeScheduledPreviewProduct(product, shopifyStoreHandle, index = 0) {
+  const source = product?.product || product || {};
+  const productId = getShopifyNumericId(source.legacyResourceId || source.id || product?.productId);
+  const title =
+    source.title ||
+    product?.productTitle ||
+    product?.title ||
+    (productId ? `Product ${productId}` : "Product");
+
+  return {
+    rowId: `scheduled-product-${productId || index}`,
+    id: productId,
+    gid: source.id?.includes?.("gid://shopify/Product/")
+      ? source.id
+      : product?.gid || (productId ? `gid://shopify/Product/${productId}` : ""),
+    title,
+    handle: source.handle || product?.handle || "",
+    adminUrl: getProductAdminUrl(shopifyStoreHandle, productId),
+  };
+}
+
+function uniqueScheduledPreviewProducts(products, shopifyStoreHandle) {
+  const unique = new Map();
+
+  products.forEach((product, index) => {
+    const normalized = normalizeScheduledPreviewProduct(
+      product,
+      shopifyStoreHandle,
+      index,
+    );
+    const key = normalized.gid || normalized.id || normalized.title || `product-${index}`;
+
+    if (!unique.has(key)) {
+      unique.set(key, normalized);
+    }
+  });
+
+  return Array.from(unique.values());
+}
+
+async function loadScheduledProducts(admin, shopifyStoreHandle) {
+  const products = [];
+  let after = null;
+
+  do {
+    const data = await scheduledTaskGraphql(admin, SCHEDULED_PRODUCTS_QUERY, {
+      first: Math.min(50, SCHEDULED_LOG_PREVIEW_LIMIT - products.length),
+      after,
+    });
+    const connection = data?.products;
+    products.push(...(connection?.nodes || []));
+    after = connection?.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+  } while (after && products.length < SCHEDULED_LOG_PREVIEW_LIMIT);
+
+  return uniqueScheduledPreviewProducts(products, shopifyStoreHandle);
+}
+
+async function loadScheduledProductsByIds(admin, productIds, shopifyStoreHandle) {
+  const ids = [
+    ...new Set(
+      getArrayValue(productIds)
+        .map((id) => {
+          const numericId = getShopifyNumericId(id);
+          return String(id || "").includes("gid://shopify/Product/")
+            ? String(id)
+            : numericId
+              ? `gid://shopify/Product/${numericId}`
+              : "";
+        })
+        .filter(Boolean),
+    ),
+  ];
+
+  if (!ids.length) return [];
+
+  const data = await scheduledTaskGraphql(admin, SCHEDULED_PRODUCT_NODES_QUERY, {
+    ids,
+  });
+
+  return uniqueScheduledPreviewProducts(data?.nodes || [], shopifyStoreHandle);
+}
+
+async function loadScheduledProductsByVariantIds(admin, variantIds, shopifyStoreHandle) {
+  const ids = [
+    ...new Set(
+      getArrayValue(variantIds)
+        .map((id) => {
+          const numericId = getShopifyNumericId(id);
+          return String(id || "").includes("gid://shopify/ProductVariant/")
+            ? String(id)
+            : numericId
+              ? `gid://shopify/ProductVariant/${numericId}`
+              : "";
+        })
+        .filter(Boolean),
+    ),
+  ];
+
+  if (!ids.length) return [];
+
+  const data = await scheduledTaskGraphql(admin, SCHEDULED_PRODUCT_NODES_QUERY, {
+    ids,
+  });
+
+  return uniqueScheduledPreviewProducts(
+    (data?.nodes || []).map((node) => node?.product).filter(Boolean),
+    shopifyStoreHandle,
+  );
+}
+
+async function loadScheduledProductsByCollectionIds(admin, collectionIds, shopifyStoreHandle) {
+  const products = [];
+  const ids = [
+    ...new Set(
+      getArrayValue(collectionIds)
+        .map((id) => {
+          const numericId = getShopifyNumericId(id);
+          return String(id || "").includes("gid://shopify/Collection/")
+            ? String(id)
+            : numericId
+              ? `gid://shopify/Collection/${numericId}`
+              : "";
+        })
+        .filter(Boolean),
+    ),
+  ];
+
+  for (const id of ids) {
+    let after = null;
+
+    do {
+      const data = await scheduledTaskGraphql(
+        admin,
+        SCHEDULED_COLLECTION_PRODUCTS_QUERY,
+        {
+          id,
+          first: Math.min(50, SCHEDULED_LOG_PREVIEW_LIMIT - products.length),
+          after,
+        },
+      );
+      const connection = data?.collection?.products;
+      products.push(...(connection?.nodes || []));
+      after = connection?.pageInfo?.hasNextPage ? connection.pageInfo.endCursor : null;
+    } while (after && products.length < SCHEDULED_LOG_PREVIEW_LIMIT);
+
+    if (products.length >= SCHEDULED_LOG_PREVIEW_LIMIT) break;
+  }
+
+  return uniqueScheduledPreviewProducts(products, shopifyStoreHandle);
+}
+
+async function getScheduledPreviewProducts(
+  admin,
+  task,
+  selectedApplyProducts,
+  shopifyStoreHandle,
+) {
+  if (!isPendingScheduledTask(task)) return [];
+
+  const applyScope = String(task.applyScope || "").toLowerCase();
+  const applyResources = task.applyResources || {};
+
+  try {
+    if (applyScope === "selected_products") {
+      if (selectedApplyProducts?.length) {
+        return uniqueScheduledPreviewProducts(
+          selectedApplyProducts,
+          shopifyStoreHandle,
+        );
+      }
+
+      return loadScheduledProductsByIds(
+        admin,
+        applyResources.productIds,
+        shopifyStoreHandle,
+      );
+    }
+
+    if (applyScope === "selected_products_with_variants") {
+      return loadScheduledProductsByVariantIds(
+        admin,
+        applyResources.variantIds,
+        shopifyStoreHandle,
+      );
+    }
+
+    if (applyScope === "selected_collections") {
+      return loadScheduledProductsByCollectionIds(
+        admin,
+        applyResources.collectionIds,
+        shopifyStoreHandle,
+      );
+    }
+
+    if (applyScope === "selected_tags") {
+      return [];
+    }
+
+    return loadScheduledProducts(admin, shopifyStoreHandle);
+  } catch (error) {
+    console.error("Failed to load scheduled task preview products:", error);
+    return uniqueScheduledPreviewProducts(
+      selectedApplyProducts || [],
+      shopifyStoreHandle,
+    );
+  }
+}
+
 function AdminLink({ url, children }) {
   if (!url) return children;
 
@@ -2044,6 +2328,49 @@ function createFallbackLogGroups(task, shopifyStoreHandle) {
       variantCount: Number(record?.variantCount || 0),
       variants: [],
       status: getCanceledStatusLabel(record?.status || getTaskStatusValue(task)),
+    };
+  });
+}
+
+function createScheduledPreviewLogGroups(
+  task,
+  scheduledPreviewProducts,
+  shopifyStoreHandle,
+  shopCurrency,
+) {
+  if (!isPendingScheduledTask(task) || !scheduledPreviewProducts?.length) {
+    return [];
+  }
+
+  const changes = getTaskChangeItems(task, shopCurrency);
+  const fallbackChange = changes.length ? changes[0] : "Scheduled price change";
+
+  return scheduledPreviewProducts.map((product, index) => {
+    const productId = getShopifyNumericId(product.id || product.gid);
+    const title = product.title || (productId ? `Product ${productId}` : "Product");
+    const changeItems = changes.length ? changes : [fallbackChange];
+
+    return {
+      rowId: `scheduled-preview-${productId || index}`,
+      productId,
+      productTitle: title,
+      adminUrl:
+        product.adminUrl || getProductAdminUrl(shopifyStoreHandle, productId),
+      changes: changeItems,
+      otherChanges: [],
+      changeSummary: {
+        items: changeItems,
+        primary: changeItems[0],
+        moreCount: Math.max(changeItems.length - 1, 0),
+      },
+      price: "-",
+      compareAtPrice: "-",
+      newSetPrice: "-",
+      cost: "-",
+      newSetCost: "-",
+      variantCount: 0,
+      variants: [],
+      status: "Schedule",
     };
   });
 }
@@ -2637,6 +2964,7 @@ export default function TaskDetailsPage() {
     selectedExcludeCollections,
     selectedApplyProducts,
     selectedExcludeProducts,
+    scheduledPreviewProducts,
     shopCurrency,
     toastMessage,
   } = useLoaderData();
@@ -2735,10 +3063,19 @@ export default function TaskDetailsPage() {
 
   const logs = useMemo(() => {
     const productLogs = createProductGroups(task, shopifyStoreHandle, shopCurrency);
+    const scheduledLogs = createScheduledPreviewLogGroups(
+      task,
+      scheduledPreviewProducts,
+      shopifyStoreHandle,
+      shopCurrency,
+    );
     const fallbackLogs = createFallbackLogGroups(task, shopifyStoreHandle);
 
-    return productLogs.length ? productLogs : fallbackLogs;
-  }, [task, shopifyStoreHandle, shopCurrency]);
+    if (productLogs.length) return productLogs;
+    if (scheduledLogs.length) return scheduledLogs;
+
+    return fallbackLogs;
+  }, [task, scheduledPreviewProducts, shopifyStoreHandle, shopCurrency]);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
