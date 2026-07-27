@@ -401,6 +401,19 @@ function formatDate(value) {
   });
 }
 
+function formatDateOnly(value) {
+  if (!value) return "-";
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+
+  return date.toLocaleDateString("en-US", {
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
 function formatTime(value) {
   if (!value) return "-";
 
@@ -3422,6 +3435,19 @@ export default function TaskDetailsPage() {
                     <StatusBadge display={visibleStatusDisplay} />
                   </InlineStack>
                 </DetailRow>
+
+                {isScheduledTask(task) ? (
+                  <>
+                    <DetailRow label="Start date" value={formatDateOnly(task.startAt || task.startDate)} />
+                    <DetailRow label="Start time" value={formatTime(task.startAt || task.startTime)} />
+                    {task.endScheduleEnabled ? (
+                      <>
+                        <DetailRow label="End date" value={formatDateOnly(task.endAt || task.endDate)} />
+                        <DetailRow label="End time" value={formatTime(task.endAt || task.endTime)} />
+                      </>
+                    ) : null}
+                  </>
+                ) : null}
 
                 {isMarketTask && taskMarkets.length ? (
                   <DetailRow label="Markets">
