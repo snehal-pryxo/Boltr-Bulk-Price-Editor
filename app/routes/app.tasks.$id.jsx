@@ -3070,8 +3070,8 @@ export default function TaskDetailsPage() {
     : rollbackCompleted
       ? {
         label: "Cancelled",
-        tone: "success",
-        background: "#D1FADF",
+        tone: "critical",
+        background: "#FED3D1",
         showProgress: false,
       }
       : rollbackFailed
