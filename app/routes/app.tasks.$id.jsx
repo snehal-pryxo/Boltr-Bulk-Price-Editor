@@ -47,6 +47,21 @@ const ACTIVE_TASK_STATUSES = [
   "Applying",
   "Cancelling",
 ];
+
+const pageOperationOverlayStyle = {
+  position: "fixed",
+  inset: 0,
+  zIndex: 520,
+  display: "grid",
+  placeItems: "center",
+  background: "rgba(255, 255, 255, 0.56)",
+  pointerEvents: "none",
+};
+
+const pageOperationSpinnerStyle = {
+  display: "grid",
+  placeItems: "center",
+};
 const SCHEDULED_LOG_PREVIEW_LIMIT = 250;
 
 const SCHEDULED_PRODUCTS_QUERY = `#graphql
@@ -130,6 +145,7 @@ export const loader = async ({ request, params }) => {
 
   if (
     ACTIVE_TASK_STATUSES.includes(task.status) &&
+    !isPendingScheduledTask(task) &&
     new Date(task.updatedAt).getTime() <
     Date.now() - TASK_EXECUTION_TIMEOUT_MS
   ) {
@@ -335,6 +351,11 @@ function isFailedOrCanceledStatus(status) {
       !normalized.includes("canceling") &&
       !normalized.includes("cancelling"))
   );
+}
+
+function isCanceledStatus(status) {
+  const normalized = normalizeStatus(status);
+  return normalized.includes("cancel") && !normalized.includes("canceling") && !normalized.includes("cancelling");
 }
 
 function getCanceledStatusLabel(status) {
@@ -830,7 +851,10 @@ function isTaskProcessing(task) {
 function isTaskPending(task) {
   const status = normalizeStatus(getTaskStatusValue(task));
 
-  return !isTaskCompleted(task) && !isTaskFailed(task) && status === "pending";
+  return (
+    isPendingScheduledTask(task) ||
+    (!isTaskCompleted(task) && !isTaskFailed(task) && status === "pending")
+  );
 }
 
 function getBaseTaskDisplay(task) {
@@ -1116,6 +1140,30 @@ function getLogStatusLabel(task, statusDisplay, rollbackState = null) {
   if (isTaskFailed(task)) return getCanceledStatusLabel(getTaskStatusValue(task));
 
   return humanize(getTaskStatusValue(task) || "Pending");
+}
+
+function getTaskLogStatusDisplay(task, visibleStatusDisplay, rollbackState) {
+  const taskStatus = getTaskStatusValue(task);
+  const scheduleStatus = task?.scheduleStatus;
+  const rollbackStatus = getRollbackStatusValue(task);
+
+  if (
+    rollbackState?.isCompleted ||
+    isCanceledStatus(taskStatus) ||
+    isCanceledStatus(scheduleStatus) ||
+    isCanceledStatus(rollbackStatus)
+  ) {
+    return { label: "Cancelled", tone: "critical" };
+  }
+
+  if (isScheduledTask(task)) {
+    return { label: "Schedule", tone: "info" };
+  }
+
+  return {
+    label: getLogStatusLabel(task, visibleStatusDisplay, rollbackState),
+    tone: getStatusToneFromDisplay(visibleStatusDisplay),
+  };
 }
 
 function getShopifyStoreHandle(shop) {
@@ -3016,7 +3064,7 @@ export default function TaskDetailsPage() {
       tone: "attention",
       background: "#FEDF89",
       progress: rollbackState.progress,
-      showPendingSpinner: true,
+      showPendingSpinner: false,
       showProgress: true,
     }
     : rollbackCompleted
@@ -3056,10 +3104,11 @@ export default function TaskDetailsPage() {
         }
       : statusDisplay;
 
-  const statusTone = getStatusToneFromDisplay(visibleStatusDisplay);
-  const logStatusLabel = isScheduledTask(task)
-    ? "Schedule"
-    : getLogStatusLabel(task, visibleStatusDisplay, rollbackState);
+  const logStatusDisplay = getTaskLogStatusDisplay(
+    task,
+    visibleStatusDisplay,
+    rollbackState,
+  );
 
   const logs = useMemo(() => {
     const productLogs = createProductGroups(task, shopifyStoreHandle, shopCurrency);
@@ -3097,7 +3146,12 @@ export default function TaskDetailsPage() {
   );
 
   const shouldPoll =
-    !selectedProductId && (taskPending || taskProcessing || rollbackProcessing);
+    !selectedProductId &&
+    (taskPending ||
+      taskProcessing ||
+      rollbackProcessing ||
+      pendingScheduledTask ||
+      runningScheduledTask);
 
   const openRollbackModal = () => {
     setRollbackModalOpen(true);
@@ -3207,7 +3261,10 @@ export default function TaskDetailsPage() {
   }, [deleteFetcher.data, navigate, shopify]);
 
   useEffect(() => {
-    if (autoReapplyFetcher.data?.disabledAutoReapply) {
+    if (
+      autoReapplyFetcher.data?.disabledAutoReapply ||
+      autoReapplyFetcher.data?.cancelledSchedule
+    ) {
       revalidator.revalidate();
     }
   }, [autoReapplyFetcher.data, revalidator]);
@@ -3302,6 +3359,13 @@ export default function TaskDetailsPage() {
       </Modal>
 
       <div style={{ maxWidth: 1400, margin: "0 auto" }}>
+        {rollbackProcessing ? (
+          <div style={pageOperationOverlayStyle}>
+            <div style={pageOperationSpinnerStyle}>
+              <Spinner accessibilityLabel="Cancelling task" size="large" />
+            </div>
+          </div>
+        ) : null}
         <Layout>
           <Layout.Section>
             <BlockStack gap="400">
@@ -3433,7 +3497,7 @@ export default function TaskDetailsPage() {
                         </IndexTable.Cell>
 
                         <IndexTable.Cell>
-                          <Badge tone={statusTone}>{logStatusLabel}</Badge>
+                          <Badge tone={logStatusDisplay.tone}>{logStatusDisplay.label}</Badge>
                         </IndexTable.Cell>
 
                         <IndexTable.Cell>

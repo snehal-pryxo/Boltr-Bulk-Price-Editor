@@ -103,6 +103,15 @@ const pageContentStyle = {
 };
 
 const ANALYTICS_CHART_DAYS = 30;
+const scheduleSummaryColor = "#0ea5e9";
+
+const rollbackTitleColumnStyle = {
+  width: 220,
+  minWidth: 220,
+  maxWidth: 220,
+  whiteSpace: "normal",
+  overflowWrap: "anywhere",
+};
 
 const donutStyle = (stats) => ({
   width: 168,
@@ -270,6 +279,69 @@ function getChangeCount(record) {
   );
 }
 
+function getRecordChangeDate(record) {
+  return isPendingScheduledRecord(record)
+    ? record.startAt || record.date || record.updatedAt || record.createdAt
+    : getRecordDate(record);
+}
+
+function getRecordAnalyticsStatus(record) {
+  return isPendingScheduledRecord(record) ? "Schedule" : record.status;
+}
+
+function normalizeRecordStatus(record) {
+  return String(record?.status || record?.scheduleStatus || "").toLowerCase();
+}
+
+function isPendingScheduledRecord(record) {
+  const status = normalizeRecordStatus(record);
+  const scheduleStatus = String(record?.scheduleStatus || "").toLowerCase();
+
+  return Boolean(
+    record?.scheduleEnabled ||
+      record?.isScheduled ||
+      status === "scheduled" ||
+      status === "schedule" ||
+      scheduleStatus === "pending" ||
+      (record?.startAt && !record?.startedAt && !record?.completedAt),
+  );
+}
+
+function getScheduledChangeCount(record) {
+  if (!isPendingScheduledRecord(record)) return 0;
+
+  const resources = getObjectValue(record.applyResources);
+  const summary = getSummary(record);
+  const summaryResources = getObjectValue(summary.applyResources);
+  const configured = getObjectValue(record.configuration);
+  const counts = [
+    resources.productIds,
+    resources.products,
+    resources.variantIds,
+    resources.variants,
+    resources.collectionIds,
+    resources.collections,
+    resources.tagNames,
+    summaryResources.productIds,
+    summaryResources.products,
+    summaryResources.variantIds,
+    summaryResources.variants,
+    summaryResources.collectionIds,
+    summaryResources.collections,
+    configured["apply_product_ids[]"],
+    configured["apply_variant_ids[]"],
+    configured["apply_collection_ids[]"],
+  ]
+    .map((value) => (Array.isArray(value) ? value.length : 0))
+    .filter(Boolean);
+
+  return Math.max(1, ...counts);
+}
+
+function getAnalyticsChangeCount(record) {
+  return Math.max(getChangeCount(record), getScheduledChangeCount(record));
+}
+
 function hasRollback(record) {
   const summary = getSummary(record);
   const rollback = summary.rollback || {};
@@ -287,6 +359,8 @@ function hasRollback(record) {
 function buildAnalysisStats(tasks, sales) {
   const completedTasks = tasks.filter((task) => isCompletedTask(task)).length;
   const completedSales = sales.filter((sale) => normalizeSaleStatus(sale.status) === SALE_STATUS.COMPLETED).length;
+  const scheduledRecords = [...tasks, ...sales].filter(isPendingScheduledRecord);
+  const scheduledChanges = scheduledRecords.reduce((sum, record) => sum + getScheduledChangeCount(record), 0);
   const taskChanges = tasks.reduce((sum, task) => sum + getChangeCount(task), 0);
   const saleChanges = sales.reduce((sum, sale) => sum + getChangeCount(sale), 0);
   const rollbacks = [...tasks, ...sales].filter(hasRollback).length;
@@ -294,20 +368,20 @@ function buildAnalysisStats(tasks, sales) {
   const allRecords = [...tasks, ...sales];
   const { currentStart, previousStart } = getPeriodBoundsForRecords();
   const changesRecords = allRecords;
-  const tasksChart = buildDailySeriesForPeriod(tasks, (task) => getRecordDate(task), () => 1, currentStart);
-  const previousTasksChart = buildDailySeriesForPeriod(tasks, (task) => getRecordDate(task), () => 1, previousStart);
-  const salesChart = buildDailySeriesForPeriod(sales, (sale) => getRecordDate(sale), () => 1, currentStart);
-  const previousSalesChart = buildDailySeriesForPeriod(sales, (sale) => getRecordDate(sale), () => 1, previousStart);
+  const tasksChart = buildDailySeriesForPeriod(tasks, getRecordChangeDate, () => 1, currentStart);
+  const previousTasksChart = buildDailySeriesForPeriod(tasks, getRecordChangeDate, () => 1, previousStart);
+  const salesChart = buildDailySeriesForPeriod(sales, getRecordChangeDate, () => 1, currentStart);
+  const previousSalesChart = buildDailySeriesForPeriod(sales, getRecordChangeDate, () => 1, previousStart);
   const changesChart = buildDailySeriesForPeriod(
     changesRecords,
-    (record) => getRecordDate(record),
-    (record) => getChangeCount(record) || 1,
+    getRecordChangeDate,
+    (record) => getAnalyticsChangeCount(record) || 1,
     currentStart,
   );
   const previousChangesChart = buildDailySeriesForPeriod(
     changesRecords,
-    (record) => getRecordDate(record),
-    (record) => getChangeCount(record) || 1,
+    getRecordChangeDate,
+    (record) => getAnalyticsChangeCount(record) || 1,
     previousStart,
   );
   const rollbacksChart = buildDailySeriesForPeriod(rollbackRecords, (record) => getRecordDate(record), () => 1, currentStart);
@@ -318,7 +392,8 @@ function buildAnalysisStats(tasks, sales) {
     sales: sales.length,
     completedTasks,
     completedSales,
-    totalChanges: taskChanges + saleChanges,
+    totalChanges: taskChanges + saleChanges + scheduledChanges,
+    scheduledChanges,
     rollbacks,
     taskChanges,
     saleChanges,
@@ -375,19 +450,19 @@ function isDateInRange(value, start, end) {
 
 function countRecordsInSelectedPeriod(records) {
   const { end, currentStart } = getPeriodBoundsForRecords();
-  return records.filter((record) => isDateInRange(getRecordDate(record), currentStart, end)).length;
+  return records.filter((record) => isDateInRange(getRecordChangeDate(record), currentStart, end)).length;
 }
 
 function countRecordsInPreviousPeriod(records) {
   const { currentStart, previousStart } = getPeriodBoundsForRecords();
-  return records.filter((record) => isDateInRange(getRecordDate(record), previousStart, currentStart)).length;
+  return records.filter((record) => isDateInRange(getRecordChangeDate(record), previousStart, currentStart)).length;
 }
 
 function sumChangesInSelectedPeriod(records) {
   const { end, currentStart } = getPeriodBoundsForRecords();
   return records.reduce((sum, record) => (
-    isDateInRange(getRecordDate(record), currentStart, end)
-      ? sum + (getChangeCount(record) || 1)
+    isDateInRange(getRecordChangeDate(record), currentStart, end)
+      ? sum + (getAnalyticsChangeCount(record) || 1)
       : sum
   ), 0);
 }
@@ -395,8 +470,8 @@ function sumChangesInSelectedPeriod(records) {
 function sumChangesInPreviousPeriod(records) {
   const { currentStart, previousStart } = getPeriodBoundsForRecords();
   return records.reduce((sum, record) => (
-    isDateInRange(getRecordDate(record), previousStart, currentStart)
-      ? sum + (getChangeCount(record) || 1)
+    isDateInRange(getRecordChangeDate(record), previousStart, currentStart)
+      ? sum + (getAnalyticsChangeCount(record) || 1)
       : sum
   ), 0);
 }
@@ -475,13 +550,13 @@ function buildApplyToCards(records, kind, options) {
     const card = grouped.get(key);
     if (!card) continue;
 
-    const changes = getChangeCount(record);
+    const changes = getAnalyticsChangeCount(record);
     card.records += 1;
     card.changes += changes;
     card.rollbacks += hasRollback(record) ? 1 : 0;
-    card.lastActivity = getLaterDate(card.lastActivity, getRecordDate(record));
+    card.lastActivity = getLaterDate(card.lastActivity, getRecordChangeDate(record));
     card.chart.push({
-      date: getRecordDate(record),
+      date: getRecordChangeDate(record),
       value: changes || 1,
     });
   }
@@ -607,7 +682,7 @@ function buildChangeTrend(tasks, sales) {
   const currentStart = getAnalyticsChartStart();
   const previousStart = new Date(currentStart);
   previousStart.setDate(currentStart.getDate() - ANALYTICS_CHART_DAYS);
-  const getRecordValue = (record) => Number(record.value) || getChangeCount(record) || 1;
+  const getRecordValue = (record) => Number(record.value) || getAnalyticsChangeCount(record) || 1;
 
   return {
     current: buildApplyToDailySeriesForPeriod(records, currentStart, getRecordValue),
@@ -620,16 +695,16 @@ function buildChartRecords(tasks, sales) {
     ...tasks.map((task) => ({
       id: `task-${task.id}`,
       kind: "task",
-      date: getRecordDate(task),
+      date: getRecordChangeDate(task),
       applyTo: normalizeApplyScope(task),
-      value: getChangeCount(task) || 1,
+      value: getAnalyticsChangeCount(task) || 1,
     })),
     ...sales.map((sale) => ({
       id: `sale-${sale.id}`,
       kind: "sale",
-      date: getRecordDate(sale),
+      date: getRecordChangeDate(sale),
       applyTo: normalizeApplyScope(sale),
-      value: getChangeCount(sale) || 1,
+      value: getAnalyticsChangeCount(sale) || 1,
     })),
   ].filter((record) => record.date);
 }
@@ -653,7 +728,7 @@ function buildApplyToDailySeriesForPeriod(records, startDate, getValue = () => 1
   }
 
   for (const record of records) {
-    const rawDate = getRecordDate(record);
+    const rawDate = getRecordChangeDate(record);
     if (!rawDate) continue;
 
     const date = new Date(rawDate);
@@ -697,11 +772,11 @@ function buildRecentChanges(tasks, sales, shop) {
       id: `task-${task.id}-${log.id || log.createdAt || log.variantId || logIndex}`,
       type: "Task",
       title: getTaskTitle(task),
-      date: log.createdAt || task.completedAt || task.updatedAt,
+      date: log.createdAt || getRecordChangeDate(task),
       target: getLogTarget(log, task, titleLookup),
       targetUrl: getShopifyAdminProductUrl(shop, log),
       change: formatChangeText(log, task),
-      status: log.action || log.status || task.status,
+      status: log.action || log.status || getRecordAnalyticsStatus(task),
       url: `/app/tasks/${task.id}`,
     }));
   });
@@ -711,11 +786,11 @@ function buildRecentChanges(tasks, sales, shop) {
       id: `sale-${sale.id}-${log.createdAt || log.variantId || log.productId || logIndex}`,
       type: "Sale",
       title: sale.title || `Sale #${sale.id}`,
-      date: log.createdAt || sale.completedAt || sale.updatedAt,
+      date: log.createdAt || getRecordChangeDate(sale),
       target: getLogTarget(log, sale, titleLookup),
       targetUrl: getShopifyAdminProductUrl(shop, log),
       change: formatChangeText(log, sale),
-      status: log.action || log.status || sale.status,
+      status: log.action || log.status || getRecordAnalyticsStatus(sale),
       url: `/app/sales/${sale.id}`,
     }));
   });
@@ -752,14 +827,18 @@ function getShopifyResourceId(value, resourceType) {
 function buildSummaryLogs(record, kind) {
   const summary = getSummary(record);
   if (Array.isArray(summary.logs) && summary.logs.length) return summary.logs;
-  const count = getChangeCount(record);
+  const count = getAnalyticsChangeCount(record);
   if (!count) return [];
 
   return [
     {
-      createdAt: record.completedAt || record.updatedAt,
-      status: record.status,
-      changes: [`${formatInteger(count)} ${kind === "sale" ? "sale" : "task"} changes`],
+      createdAt: getRecordChangeDate(record),
+      status: getRecordAnalyticsStatus(record),
+      changes: [
+        isPendingScheduledRecord(record)
+          ? `${formatInteger(count)} scheduled ${kind === "sale" ? "sale" : "task"} changes`
+          : `${formatInteger(count)} ${kind === "sale" ? "sale" : "task"} changes`,
+      ],
     },
   ];
 }
@@ -845,7 +924,7 @@ function formatChangeText(log, record) {
     return `Price: ${formatBlank(previous)} -> ${formatBlank(next)}`;
   }
 
-  return `${formatInteger(getChangeCount(record))} changes`;
+  return `${formatInteger(getAnalyticsChangeCount(record))} changes`;
 }
 
 function buildRollbackRows(tasks, sales) {
@@ -959,14 +1038,16 @@ function parseLocalDate(value) {
 function buildDonutGradient(stats) {
   const task = Number(stats.taskChanges) || 0;
   const sale = Number(stats.saleChanges) || 0;
+  const scheduled = Number(stats.scheduledChanges) || 0;
   const rollback = Number(stats.rollbacks) || 0;
-  const total = task + sale + rollback;
+  const total = task + sale + scheduled + rollback;
 
   if (!total) return "conic-gradient(#e3e6ea 0 100%)";
 
   const taskEnd = (task / total) * 100;
   const saleEnd = taskEnd + (sale / total) * 100;
-  return `conic-gradient(#10a37f 0 ${taskEnd}%, #6d5dfc ${taskEnd}% ${saleEnd}%, #f59e0b ${saleEnd}% 100%)`;
+  const scheduledEnd = saleEnd + (scheduled / total) * 100;
+  return `conic-gradient(#10a37f 0 ${taskEnd}%, #6d5dfc ${taskEnd}% ${saleEnd}%, ${scheduleSummaryColor} ${saleEnd}% ${scheduledEnd}%, #f59e0b ${scheduledEnd}% 100%)`;
 }
 
 function MetricCard({
@@ -1222,6 +1303,7 @@ function SummaryCard({ stats }) {
   const total = Math.max(1, stats.totalChanges + stats.rollbacks);
   const taskPercent = Math.round((stats.taskChanges / total) * 100);
   const salePercent = Math.round((stats.saleChanges / total) * 100);
+  const scheduledPercent = Math.round((stats.scheduledChanges / total) * 100);
   const rollbackPercent = Math.round((stats.rollbacks / total) * 100);
 
   return (
@@ -1246,6 +1328,7 @@ function SummaryCard({ stats }) {
           <BlockStack gap="300">
             <LegendRow color="#10a37f" label="Task changes" value={stats.taskChanges} percent={taskPercent} />
             <LegendRow color="#6d5dfc" label="Sale changes" value={stats.saleChanges} percent={salePercent} />
+            <LegendRow color={scheduleSummaryColor} label="Scheduled changes" value={stats.scheduledChanges} percent={scheduledPercent} />
             <LegendRow color="#f59e0b" label="Rollbacks" value={stats.rollbacks} percent={rollbackPercent} />
           </BlockStack>
         </InlineStack>
@@ -1430,14 +1513,16 @@ function RollbacksTable({ rows = [] }) {
         {safeRows.map((row, index) => (
           <IndexTable.Row id={row.id} key={row.id} position={index}>
             <IndexTable.Cell>
-              <BlockStack gap="050">
-                <Link url={row.url} removeUnderline>
-                  {row.title}
-                </Link>
-                <Text as="span" tone="subdued">
-                  {row.type}
-                </Text>
-              </BlockStack>
+              <div style={rollbackTitleColumnStyle}>
+                <BlockStack gap="050">
+                  <Link url={row.url} removeUnderline>
+                    {row.title}
+                  </Link>
+                  <Text as="span" tone="subdued">
+                    {row.type}
+                  </Text>
+                </BlockStack>
+              </div>
             </IndexTable.Cell>
             <IndexTable.Cell>{formatInteger(row.changes)}</IndexTable.Cell>
             <IndexTable.Cell>{formatDate(row.date)}</IndexTable.Cell>

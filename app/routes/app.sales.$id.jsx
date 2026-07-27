@@ -58,6 +58,21 @@ import NewSalePage, {
 const LOGS_PER_PAGE = 8;
 const EDIT_SALE_URL = "/app/sales/new";
 
+const pageOperationOverlayStyle = {
+  position: "fixed",
+  inset: 0,
+  zIndex: 520,
+  display: "grid",
+  placeItems: "center",
+  background: "rgba(255, 255, 255, 0.56)",
+  pointerEvents: "none",
+};
+
+const pageOperationSpinnerStyle = {
+  display: "grid",
+  placeItems: "center",
+};
+
 const confirmationModalContentStyle = {
   fontSize: 16,
   fontWeight: 600,
@@ -498,6 +513,10 @@ function mergeLogStatus(currentStatus, nextStatus) {
     String(status || "").toLowerCase(),
   );
 
+  if (statuses.some((status) => status.includes("cancel"))) {
+    return "Canceled";
+  }
+
   if (statuses.some((status) => status.includes("fail") || status.includes("error"))) {
     return "Failed";
   }
@@ -511,6 +530,42 @@ function mergeLogStatus(currentStatus, nextStatus) {
   }
 
   return currentStatus || nextStatus || "Applied";
+}
+
+function isCanceledSaleStatus(status) {
+  const normalized = normalizeSaleStatus(status);
+  return normalized === SALE_STATUS.CANCELED || String(status || "").toLowerCase().includes("cancelled");
+}
+
+function getSaleLogStatusDisplay(sale, log) {
+  const status = log?.status || sale?.status || "";
+  const normalizedStatus = String(status || "").toLowerCase();
+
+  if (isCanceledSaleStatus(sale?.status) || isCanceledSaleStatus(status)) {
+    return { label: "Canceled", tone: "critical" };
+  }
+
+  if (normalizedStatus.includes("fail") || normalizedStatus.includes("error")) {
+    return { label: "Failed", tone: "critical" };
+  }
+
+  if (normalizedStatus.includes("skip")) {
+    return { label: "Skipped", tone: "attention" };
+  }
+
+  if (normalizedStatus.includes("schedule")) {
+    return { label: "Schedule", tone: "info" };
+  }
+
+  if (normalizedStatus.includes("applied") || normalizedStatus.includes("updated")) {
+    return { label: "Applied", tone: "success" };
+  }
+
+  const display = getSaleStatusDisplay({ ...sale, status });
+  return {
+    label: display.label || "Applied",
+    tone: display.tone === "subdued" ? "success" : display.tone,
+  };
 }
 
 function getVisibleSaleLogs(sale) {
@@ -1027,6 +1082,13 @@ function SaleDetailsContent() {
           },
         ]}
       >
+        {isRollbackSubmitting ? (
+          <div style={pageOperationOverlayStyle}>
+            <div style={pageOperationSpinnerStyle}>
+              <Spinner accessibilityLabel="Disabling sale" size="large" />
+            </div>
+          </div>
+        ) : null}
         <Layout>
           <Layout.Section>
             <BlockStack gap="400">
@@ -1130,7 +1192,7 @@ function SaleDetailsContent() {
                     <InlineStack gap="200" blockAlign="center" wrap={false}>
                       <Badge tone={statusDisplay.tone}>
                         <InlineStack gap="100" blockAlign="center" wrap={false}>
-                          {statusDisplay.showSpinner ? (
+                          {statusDisplay.showSpinner && !isRollbackSubmitting ? (
                             <CompactSpinner label={`${statusDisplay.label} sale`} />
                           ) : null}
                           <span>{statusDisplay.label}</span>
@@ -1196,6 +1258,7 @@ function SaleDetailsContent() {
                     {paginatedLogs.map((log, index) => {
                       const resourceUrl = getLogResourceUrl(shop, log, useVariantLogLinks);
                       const resourceTitle = getLogResourceTitle(log, useVariantLogLinks);
+                      const logStatusDisplay = getSaleLogStatusDisplay(visibleSale, log);
                       const rowId = useVariantLogLinks
                         ? log.variantId || log.id || index
                         : log.productId || log.productTitle || log.id || index;
@@ -1229,7 +1292,7 @@ function SaleDetailsContent() {
                           </BlockStack>
                         </IndexTable.Cell>
                         <IndexTable.Cell>
-                          <Badge tone="success">{log.status || "Applied"}</Badge>
+                          <Badge tone={logStatusDisplay.tone}>{logStatusDisplay.label}</Badge>
                         </IndexTable.Cell>
                         <IndexTable.Cell>
                           <Button
@@ -1287,7 +1350,7 @@ function SaleDetailsContent() {
         size="small"
         primaryAction={{
           content: "Disable",
-          loading: isSubmitting,
+          loading: isRollbackSubmitting,
           onAction: () => {
             setOptimisticRollbackStartedAt(new Date().toISOString());
             setRollbackConfirmOpen(false);
