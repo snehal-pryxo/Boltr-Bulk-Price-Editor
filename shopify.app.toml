@@ -1,7 +1,7 @@
 # Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
 
 client_id = "c0a4f57c6f2803211055e011288accb6"
-application_url = "https://bulk-price-editor-lz64.vercel.app"
+application_url = "https://boltrapp.pryxotech.com"
 embedded = true
 
 name = "Boltr Bulk Price Editor"
@@ -11,15 +11,15 @@ handle = "bulk-price-editor-boltr"
 api_version = "2026-07"
 
   [[webhooks.subscriptions]]
-  uri = "https://bulk-price-editor-lz64.vercel.app/webhooks"
+  uri = "https://boltrapp.pryxotech.com/webhooks"
   topics = [ "app/scopes_update" ]
 
   [[webhooks.subscriptions]]
-  uri = "https://bulk-price-editor-lz64.vercel.app/webhooks"
+  uri = "https://boltrapp.pryxotech.com/webhooks"
   topics = [ "app/uninstalled" ]
 
   [[webhooks.subscriptions]]
-  uri = "https://bulk-price-editor-lz64.vercel.app/webhooks"
+  uri = "https://boltrapp.pryxotech.com/webhooks"
   compliance_topics = [ "customers/data_request", "customers/redact", "shop/redact" ]
 
 [access_scopes]
@@ -28,9 +28,9 @@ scopes = "read_products,write_products,read_inventory,write_inventory,read_theme
 
 [auth]
 redirect_urls = [
-  "https://bulk-price-editor-lz64.vercel.app/auth/callback",
-  "https://bulk-price-editor-lz64.vercel.app/shopify/callback",
-  "https://bulk-price-editor-lz64.vercel.app/api/auth/callback"
+  "https://boltrapp.pryxotech.com/auth/callback",
+  "https://boltrapp.pryxotech.com/shopify/callback",
+  "https://boltrapp.pryxotech.com/api/auth/callback"
 ]
 
 [build]

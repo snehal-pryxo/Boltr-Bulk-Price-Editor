@@ -1,3 +1,39 @@
-.cache
-build
+# Dependencies & build output (rebuilt inside the image)
 node_modules
+**/node_modules
+build
+app/build
+public/build
+extensions/*/dist
+.cache
+.vercel
+
+# Secrets — never bake env files into the image (any depth)
+**/.env
+**/.env.*
+
+# Version control
+.git
+.gitignore
+
+# Docker itself
+Dockerfile
+.dockerignore
+
+# Shopify CLI local dev state
+.shopify
+.shopify.lock
+
+# Local databases
+prisma/dev.sqlite
+prisma/dev.sqlite-journal
+database.sqlite
+*.sqlite
+
+# Logs & OS cruft
+*.log
+.DS_Store
+
+# Docs
+README.md
+CHANGELOG.md

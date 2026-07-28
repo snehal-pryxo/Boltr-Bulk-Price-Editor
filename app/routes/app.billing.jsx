@@ -61,7 +61,7 @@ function isBillingTestMode() {
 
 function getBillingReturnUrl(shop) {
   const storeHandle = String(shop || "").replace(".myshopify.com", "");
-  const appHandle = process.env.SHOPIFY_APP_HANDLE || "pryxo-bulk-price-editor";
+  const appHandle = process.env.SHOPIFY_APP_HANDLE || "bulk-price-editor-boltr";
 
   if (storeHandle && appHandle) {
     return `https://admin.shopify.com/store/${storeHandle}/apps/${appHandle}/app/`;
