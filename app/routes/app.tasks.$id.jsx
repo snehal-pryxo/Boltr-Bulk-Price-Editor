@@ -63,6 +63,16 @@ const pageOperationSpinnerStyle = {
   placeItems: "center",
 };
 const SCHEDULED_LOG_PREVIEW_LIMIT = 250;
+const TASK_JSON_FIELDS = [
+  "selectedMarkets",
+  "priceChange",
+  "compareAtPriceChange",
+  "costPerItemChange",
+  "applyResources",
+  "excludeResources",
+  "configuration",
+  "executionSummary",
+];
 
 const SCHEDULED_PRODUCTS_QUERY = `#graphql
   query ScheduledTaskProducts($first: Int!, $after: String) {
@@ -120,8 +130,47 @@ const SCHEDULED_COLLECTION_PRODUCTS_QUERY = `#graphql
 `;
 
 export const loader = async ({ request, params }) => {
-  const { admin, session } = await authenticate.admin(request);
-  const flashSession = await getFlashSession(request);
+  const timing = createLoaderTiming("task-details", params.id);
+  const fail = (step, error, status = 500) => {
+    logLoaderFailure(step, error, timing);
+    return json(
+      {
+        ok: false,
+        error: "Task details could not be loaded.",
+        failedStep: step,
+      },
+      { status },
+    );
+  };
+
+  timing.mark("START Loader");
+  console.info("[task-details-loader] START Loader", {
+    taskId: params.id,
+    url: request.url,
+  });
+
+  let admin;
+  let session;
+  let flashSession;
+  let task;
+
+  try {
+    ({ admin, session } = await authenticate.admin(request));
+    timing.mark("Authentication completed");
+    console.info("[task-details-loader] Authentication completed", {
+      shop: session?.shop,
+    });
+  } catch (error) {
+    return fail("Authentication", error, 401);
+  }
+
+  try {
+    flashSession = await getFlashSession(request);
+  } catch (error) {
+    logLoaderFailure("Flash session load", error, timing);
+    flashSession = null;
+  }
+
   const taskId = Number(params.id);
   const url = new URL(request.url);
   const selectedProductId = getShopifyNumericId(
@@ -129,108 +178,309 @@ export const loader = async ({ request, params }) => {
   );
 
   if (!Number.isInteger(taskId) || taskId <= 0) {
-    throw new Response("Task not found", { status: 404 });
+    return fail("Task id validation", new Error(`Invalid task id: ${params.id}`), 404);
   }
 
-  let task = await db.task.findFirst({
-    where: {
-      id: taskId,
-      shop: session.shop,
-    },
-  });
-
-  if (!task) {
-    throw new Response("Task not found", { status: 404 });
-  }
-
-  if (
-    ACTIVE_TASK_STATUSES.includes(task.status) &&
-    !isPendingScheduledTask(task) &&
-    new Date(task.updatedAt).getTime() <
-    Date.now() - TASK_EXECUTION_TIMEOUT_MS
-  ) {
-    await db.task.updateMany({
-      where: { id: task.id, shop: session.shop },
-      data: {
-        status: "Cancelled",
-        executionSummary: {
-          ...(task.executionSummary || {}),
-          ok: false,
-          progress: 100,
-          status: "Cancelled",
-          error: "Task execution timed out before Shopify finished responding.",
+  try {
+    const [taskRecord, shopRecord] = await Promise.all([
+      db.task.findFirst({
+        where: {
+          id: taskId,
+          shop: session.shop,
         },
-        completedAt: new Date(),
-      },
-    });
-    task = await db.task.findFirst({
-      where: {
-        id: taskId,
-        shop: session.shop,
-      },
-    });
-  }
-
-  const shopifyStoreHandle = getShopifyStoreHandle(session.shop);
-  const shopCurrency =
-    (
-      await db.shop.findUnique({
+      }),
+      db.shop.findUnique({
         where: { shop: session.shop },
         select: { currency: true },
-      })
-    )?.currency || "";
-  const selectedApplyCollections = isCollectionScope(task, "apply")
-    ? await getSelectedCollectionDetails(admin, task, shopifyStoreHandle, "apply")
-    : [];
-  const selectedExcludeCollections = isCollectionScope(task, "exclude")
-    ? await getSelectedCollectionDetails(admin, task, shopifyStoreHandle, "exclude")
-    : [];
-  const selectedApplyProducts = await getSelectedProductDetails(
-    admin,
-    task,
-    shopifyStoreHandle,
-    "apply",
-  );
-  const selectedExcludeProducts = await getSelectedProductDetails(
-    admin,
-    task,
-    shopifyStoreHandle,
-    "exclude",
-  );
-  const scheduledPreviewProducts = await getScheduledPreviewProducts(
-    admin,
-    task,
-    selectedApplyProducts,
-    shopifyStoreHandle,
-  );
+      }),
+    ]);
 
-  return json({
-    task,
-    shop: session.shop,
-    shopifyStoreHandle,
-    selectedProductId,
-    selectedCollections: selectedApplyCollections,
-    selectedApplyCollections,
-    selectedExcludeCollections,
-    selectedApplyProducts,
-    selectedExcludeProducts,
-    scheduledPreviewProducts,
-    productDetails: selectedProductId
-      ? getProductDetails(
-        task,
-        selectedProductId,
-        shopifyStoreHandle,
-        shopCurrency,
+    timing.mark("Database loaded");
+    console.info("[task-details-loader] Database loaded", {
+      shop: session.shop,
+      taskFound: Boolean(taskRecord),
+      currencyFound: Boolean(shopRecord?.currency),
+    });
+
+    if (!taskRecord) {
+      return fail("Task loaded", new Error(`Task ${taskId} not found for ${session.shop}`), 404);
+    }
+
+    task = normalizeTaskRecord(taskRecord);
+    timing.mark("Task loaded");
+    console.info("[task-details-loader] Task loaded", {
+      taskId: task.id,
+      status: task.status,
+      applyScope: task.applyScope,
+      scheduleStatus: task.scheduleStatus,
+    });
+
+    if (shouldCancelTimedOutTask(task)) {
+      const nextExecutionSummary = {
+        ...getObjectValue(task.executionSummary),
+        ok: false,
+        progress: 100,
+        status: "Cancelled",
+        error: "Task execution timed out before Shopify finished responding.",
+      };
+
+      await db.task.updateMany({
+        where: { id: task.id, shop: session.shop },
+        data: {
+          status: "Cancelled",
+          executionSummary: serializeJsonField(nextExecutionSummary),
+          completedAt: new Date(),
+        },
+      });
+
+      const refreshedTask = await db.task.findFirst({
+        where: {
+          id: taskId,
+          shop: session.shop,
+        },
+      });
+      task = normalizeTaskRecord(refreshedTask || task);
+      timing.mark("Timed out task cancelled");
+      console.info("[task-details-loader] Timed out task cancelled", {
+        taskId: task.id,
+      });
+    }
+
+    const shopifyStoreHandle = getShopifyStoreHandle(session.shop);
+    const shopCurrency = shopRecord?.currency || "";
+
+    const selectedApplyCollections = await runLoaderStep(
+      "Collections loaded",
+      timing,
+      async () =>
+        isCollectionScope(task, "apply")
+          ? getSelectedCollectionDetails(admin, task, shopifyStoreHandle, "apply")
+          : [],
+      [],
+    );
+
+    const selectedExcludeCollections = await runLoaderStep(
+      "Exclude collections loaded",
+      timing,
+      async () =>
+        isCollectionScope(task, "exclude")
+          ? getSelectedCollectionDetails(admin, task, shopifyStoreHandle, "exclude")
+          : [],
+      [],
+    );
+
+    const selectedApplyProducts = await runLoaderStep(
+      "Products loaded",
+      timing,
+      () => getSelectedProductDetails(admin, task, shopifyStoreHandle, "apply"),
+      [],
+    );
+
+    const selectedExcludeProducts = await runLoaderStep(
+      "Exclude products loaded",
+      timing,
+      () => getSelectedProductDetails(admin, task, shopifyStoreHandle, "exclude"),
+      [],
+    );
+
+    const scheduledPreviewProducts = await runLoaderStep(
+      "Scheduled preview loaded",
+      timing,
+      () =>
+        getScheduledPreviewProducts(
+          admin,
+          task,
+          selectedApplyProducts,
+          shopifyStoreHandle,
+        ),
+      [],
+    );
+
+    const productDetails = selectedProductId
+      ? runSyncLoaderStep(
+        "Product details loaded",
+        timing,
+        () =>
+          getProductDetails(
+            task,
+            selectedProductId,
+            shopifyStoreHandle,
+            shopCurrency,
+          ),
+        null,
       )
-      : null,
-    shopCurrency,
-    toastMessage: flashSession.get("toast") || "",
-  }, {
-    headers: {
-      "Set-Cookie": await commitFlashSession(flashSession),
-    },
-  });
+      : null;
+
+    timing.mark("Returning response");
+    console.info("[task-details-loader] Returning response", {
+      taskId: task.id,
+      selectedApplyCollections: selectedApplyCollections.length,
+      selectedExcludeCollections: selectedExcludeCollections.length,
+      selectedApplyProducts: selectedApplyProducts.length,
+      selectedExcludeProducts: selectedExcludeProducts.length,
+      scheduledPreviewProducts: scheduledPreviewProducts.length,
+      elapsedMs: timing.elapsed(),
+    });
+
+    const headers = {};
+    if (flashSession) {
+      try {
+        headers["Set-Cookie"] = await commitFlashSession(flashSession);
+      } catch (error) {
+        logLoaderFailure("Flash session commit", error, timing);
+      }
+    }
+
+    return json(
+      {
+        task,
+        shop: session.shop,
+        shopifyStoreHandle,
+        selectedProductId,
+        selectedCollections: selectedApplyCollections,
+        selectedApplyCollections,
+        selectedExcludeCollections,
+        selectedApplyProducts,
+        selectedExcludeProducts,
+        scheduledPreviewProducts,
+        productDetails,
+        shopCurrency,
+        toastMessage: flashSession?.get("toast") || "",
+      },
+      { headers },
+    );
+  } catch (error) {
+    return fail("Database/task response assembly", error, 500);
+  }
 };
+
+function createLoaderTiming(name, taskId) {
+  const startedAt = Date.now();
+  const marks = [];
+
+  return {
+    mark(step) {
+      const elapsedMs = Date.now() - startedAt;
+      marks.push({ step, elapsedMs });
+      console.info(`[${name}-loader] ${step}`, {
+        taskId,
+        elapsedMs,
+      });
+    },
+    elapsed() {
+      return Date.now() - startedAt;
+    },
+    summary() {
+      return {
+        elapsedMs: Date.now() - startedAt,
+        marks,
+      };
+    },
+  };
+}
+
+function logLoaderFailure(step, error, timing) {
+  const normalized = normalizeErrorForLog(error);
+  console.error(`FAILED AT STEP: ${step}`, {
+    ...normalized,
+    timing: timing?.summary?.(),
+  });
+  if (error?.stack) {
+    console.error(error.stack);
+  }
+}
+
+function normalizeErrorForLog(error) {
+  return {
+    name: error?.name || "Error",
+    message: error?.message || String(error),
+    code: error?.code,
+    meta: error?.meta,
+    stack: error?.stack,
+  };
+}
+
+async function runLoaderStep(step, timing, fn, fallbackValue) {
+  const startedAt = Date.now();
+
+  try {
+    const value = await fn();
+    timing.mark(step);
+    console.info("[task-details-loader] Step completed", {
+      step,
+      elapsedMs: Date.now() - startedAt,
+      resultType: Array.isArray(value) ? "array" : typeof value,
+      resultCount: Array.isArray(value) ? value.length : undefined,
+    });
+
+    return value === undefined ? fallbackValue : value;
+  } catch (error) {
+    logLoaderFailure(step, error, timing);
+    return fallbackValue;
+  }
+}
+
+function runSyncLoaderStep(step, timing, fn, fallbackValue) {
+  const startedAt = Date.now();
+
+  try {
+    const value = fn();
+    timing.mark(step);
+    console.info("[task-details-loader] Step completed", {
+      step,
+      elapsedMs: Date.now() - startedAt,
+      resultType: Array.isArray(value) ? "array" : typeof value,
+      resultCount: Array.isArray(value) ? value.length : undefined,
+    });
+
+    return value === undefined ? fallbackValue : value;
+  } catch (error) {
+    logLoaderFailure(step, error, timing);
+    return fallbackValue;
+  }
+}
+
+function normalizeTaskRecord(record) {
+  if (!record) return null;
+
+  const normalized = { ...record };
+
+  TASK_JSON_FIELDS.forEach((field) => {
+    normalized[field] = normalizeJsonObjectField(record[field], field);
+  });
+
+  return normalized;
+}
+
+function normalizeJsonObjectField(value, field) {
+  const parsed = readJsonField(value);
+
+  if (field === "selectedMarkets") {
+    return Array.isArray(parsed) ? parsed : [];
+  }
+
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    return parsed;
+  }
+
+  return {};
+}
+
+function serializeJsonField(value) {
+  if (value === undefined) return null;
+  return value;
+}
+
+function shouldCancelTimedOutTask(task) {
+  if (!task) return false;
+  if (!ACTIVE_TASK_STATUSES.includes(task.status)) return false;
+  if (isPendingScheduledTask(task)) return false;
+
+  const updatedAt = new Date(task.updatedAt).getTime();
+  if (Number.isNaN(updatedAt)) return false;
+
+  return updatedAt < Date.now() - TASK_EXECUTION_TIMEOUT_MS;
+}
 
 export const action = async ({ request, params }) => {
   const { session } = await authenticate.admin(request);
@@ -1584,7 +1834,8 @@ async function fetchCollectionByText(admin, collection) {
     : `title:'${escapeShopifySearchValue(title)}'`;
 
   try {
-    const response = await admin.graphql(
+    const payload = await scheduledTaskGraphql(
+      admin,
       `#graphql
       query CollectionByText($query: String!) {
         collections(first: 1, query: $query) {
@@ -1596,10 +1847,10 @@ async function fetchCollectionByText(admin, collection) {
           }
         }
       }`,
-      { variables: { query: queryText } },
+      { query: queryText },
+      "CollectionByText",
     );
-    const payload = await response.json();
-    return payload?.data?.collections?.nodes?.[0] || null;
+    return payload?.collections?.nodes?.[0] || null;
   } catch (error) {
     console.error("Failed to search selected collection:", error);
     return null;
@@ -1635,7 +1886,8 @@ async function getSelectedCollectionDetails(admin, task, shopifyStoreHandle, pre
 
   if (idsToFetch.length && admin?.graphql) {
     try {
-      const response = await admin.graphql(
+      const data = await scheduledTaskGraphql(
+        admin,
         `#graphql
         query SelectedCollections($ids: [ID!]!) {
           nodes(ids: $ids) {
@@ -1647,10 +1899,10 @@ async function getSelectedCollectionDetails(admin, task, shopifyStoreHandle, pre
             }
           }
         }`,
-        { variables: { ids: idsToFetch } },
+        { ids: idsToFetch },
+        "SelectedCollections",
       );
-      const payload = await response.json();
-      const nodes = payload?.data?.nodes || [];
+      const nodes = data?.nodes || [];
       const foundGids = new Set();
 
       nodes.forEach((node) => {
@@ -1772,7 +2024,8 @@ async function getSelectedProductDetails(admin, task, shopifyStoreHandle, prefix
 
   if (idsToFetch.length && admin?.graphql) {
     try {
-      const response = await admin.graphql(
+      const data = await scheduledTaskGraphql(
+        admin,
         `#graphql
         query SelectedProducts($ids: [ID!]!) {
           nodes(ids: $ids) {
@@ -1784,10 +2037,10 @@ async function getSelectedProductDetails(admin, task, shopifyStoreHandle, prefix
             }
           }
         }`,
-        { variables: { ids: idsToFetch } },
+        { ids: idsToFetch },
+        "SelectedProducts",
       );
-      const payload = await response.json();
-      const nodes = payload?.data?.nodes || [];
+      const nodes = data?.nodes || [];
 
       nodes.forEach((node) => {
         if (!node?.id) return;
@@ -1829,17 +2082,89 @@ async function getSelectedProductDetails(admin, task, shopifyStoreHandle, prefix
   );
 }
 
-async function scheduledTaskGraphql(admin, query, variables = {}) {
-  if (!admin?.graphql) return null;
+async function scheduledTaskGraphql(admin, query, variables = {}, operationName = "") {
+  const operation = operationName || getGraphqlOperationName(query);
 
-  const response = await admin.graphql(query, { variables });
-  const payload = await response.json();
-
-  if (payload?.errors?.length) {
-    throw new Error(payload.errors.map((error) => error.message).join("; "));
+  if (!admin?.graphql) {
+    console.warn("[task-details-loader] Shopify GraphQL unavailable", {
+      operation,
+    });
+    return null;
   }
 
-  return payload?.data || null;
+  const startedAt = Date.now();
+
+  try {
+    console.info("[task-details-loader] Shopify GraphQL request", {
+      operation,
+      variables: summarizeGraphqlVariables(variables),
+    });
+
+    const response = await admin.graphql(query, { variables });
+    const status = response?.status;
+
+    if (status && (status < 200 || status >= 300)) {
+      throw new Error(`Shopify GraphQL HTTP ${status} for ${operation}`);
+    }
+
+    let payload;
+    try {
+      payload = await response.json();
+    } catch (error) {
+      error.message = `Shopify GraphQL JSON parse failed for ${operation}: ${error.message}`;
+      throw error;
+    }
+
+    if (payload?.errors?.length) {
+      const message = payload.errors
+        .map((error) => error?.message || JSON.stringify(error))
+        .join("; ");
+      const graphqlError = new Error(`Shopify GraphQL errors for ${operation}: ${message}`);
+      graphqlError.graphqlErrors = payload.errors;
+      throw graphqlError;
+    }
+
+    if (!payload || typeof payload !== "object" || !("data" in payload)) {
+      throw new Error(`Shopify GraphQL returned an invalid payload for ${operation}`);
+    }
+
+    console.info("[task-details-loader] Shopify GraphQL response", {
+      operation,
+      elapsedMs: Date.now() - startedAt,
+      status,
+    });
+
+    return payload.data || null;
+  } catch (error) {
+    console.error("[task-details-loader] Shopify GraphQL failed", {
+      operation,
+      variables: summarizeGraphqlVariables(variables),
+      elapsedMs: Date.now() - startedAt,
+      ...normalizeErrorForLog(error),
+      graphqlErrors: error?.graphqlErrors,
+    });
+    throw error;
+  }
+}
+
+function getGraphqlOperationName(query) {
+  return String(query || "").match(/\b(query|mutation)\s+([A-Za-z0-9_]+)/)?.[2] || "UnknownOperation";
+}
+
+function summarizeGraphqlVariables(variables = {}) {
+  return Object.fromEntries(
+    Object.entries(variables || {}).map(([key, value]) => {
+      if (Array.isArray(value)) {
+        return [key, { count: value.length, sample: value.slice(0, 3) }];
+      }
+
+      if (typeof value === "string" && value.length > 120) {
+        return [key, `${value.slice(0, 120)}...`];
+      }
+
+      return [key, value];
+    }),
+  );
 }
 
 function normalizeScheduledPreviewProduct(product, shopifyStoreHandle, index = 0) {
@@ -2834,12 +3159,6 @@ function ResourceList({ records, type, shopifyStoreHandle }) {
                   {item.title || item.handle || `Product ${productId || ""}`.trim()}
                 </AdminLink>
               </Text>
-       
-              {url ? (
-                <Text as="p" fontWeight="regular">
-                  <AdminLink url={url}>Open in Shopify Admin</AdminLink>
-                </Text>
-              ) : null}
             </BlockStack>
           );
         }
