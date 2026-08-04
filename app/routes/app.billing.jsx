@@ -1,11 +1,13 @@
-import { json } from "@remix-run/node";
+import { json, redirect } from "@remix-run/node";
 import {
   Form,
   useActionData,
   useLoaderData,
+  useNavigate,
   useNavigation,
   useSearchParams,
 } from "@remix-run/react";
+import { useEffect, useRef } from "react";
 import { TitleBar } from "@shopify/app-bridge-react";
 import {
   Badge,
@@ -31,6 +33,8 @@ const BILLING_PLAN_SETTING_KEY = "billing.plan";
 export async function loader({ request }) {
   const { billing, session } = await authenticate.admin(request);
   const url = new URL(request.url);
+  const hasBillingReturn = url.searchParams.get("billing_return") === "1";
+  const requestedPlan = url.searchParams.get("billing_plan") || "";
   const billingTestMode = isBillingTestMode();
   const billingCheck = await billing.check({
     plans: ALL_PRICING_PLAN_KEYS,
@@ -38,20 +42,24 @@ export async function loader({ request }) {
   });
   const activeSubscription = billingCheck.appSubscriptions?.[0] || null;
   const activePlan = activeSubscription?.name || FREE_PLAN_NAME;
-
-  await saveBillingPlan(session.shop, activePlan);
+  const hasActivePayment = Boolean(billingCheck.hasActivePayment);
 
   const billingStatus = getBillingStatus({
-    hasBillingReturn: url.searchParams.get("billing_return") === "1",
-    hasActivePayment: Boolean(billingCheck.hasActivePayment),
+    hasBillingReturn,
+    requestedPlan,
+    hasActivePayment,
     activePlan,
   });
+
+  if (!hasBillingReturn || billingStatus?.verified) {
+    await saveBillingPlan(session.shop, activePlan);
+  }
 
   return json({
     activePlan,
     billingStatus,
     billingTestMode,
-    hasActivePayment: Boolean(billingCheck.hasActivePayment),
+    hasActivePayment,
   });
 }
 
@@ -80,11 +88,7 @@ export async function action({ request }) {
 
       await saveBillingPlan(session.shop, FREE_PLAN_NAME);
 
-      return json({
-        ok: true,
-        message: "Free Plan is active.",
-        activePlan: FREE_PLAN_NAME,
-      });
+      return redirect("/app?billing_status=free_plan_active");
     } catch (error) {
       console.error("Unable to activate free billing plan.", {
         shop: session.shop,
@@ -106,7 +110,7 @@ export async function action({ request }) {
     return json({ ok: false, message: "Invalid plan selected." }, { status: 400 });
   }
 
-  const returnUrl = getBillingReturnUrl(session.shop);
+  const returnUrl = getBillingReturnUrl(session.shop, plan);
 
   try {
     return await billing.request({
@@ -144,31 +148,46 @@ function isBillingTestMode() {
   return true;
 }
 
-function getBillingReturnUrl(shop) {
+function getBillingReturnUrl(shop, plan) {
   const storeHandle = String(shop || "").replace(".myshopify.com", "");
   const appHandle = process.env.SHOPIFY_APP_HANDLE || "bulk-price-editor-boltr";
+  const returnSearchParams = new URLSearchParams({
+    billing_return: "1",
+    billing_plan: plan,
+  });
 
   if (storeHandle && appHandle) {
-    return `https://admin.shopify.com/store/${storeHandle}/apps/${appHandle}/app/billing?billing_return=1`;
+    return `https://admin.shopify.com/store/${storeHandle}/apps/${appHandle}/app/billing?${returnSearchParams.toString()}`;
   }
 
   const returnUrl = new URL(
     "/app/billing",
     process.env.SHOPIFY_APP_URL || "https://app.local",
   );
-  returnUrl.searchParams.set("billing_return", "1");
+  returnUrl.search = returnSearchParams.toString();
   return returnUrl.toString();
 }
 
-function getBillingStatus({ hasBillingReturn, hasActivePayment, activePlan }) {
+function getBillingStatus({
+  hasBillingReturn,
+  requestedPlan,
+  hasActivePayment,
+  activePlan,
+}) {
   if (!hasBillingReturn) {
     return null;
   }
 
-  if (hasActivePayment) {
+  if (
+    hasActivePayment &&
+    ALL_PRICING_PLAN_KEYS.includes(requestedPlan) &&
+    activePlan === requestedPlan
+  ) {
     return {
       tone: "success",
       message: `${activePlan} is active.`,
+      verified: true,
+      redirectToApp: true,
     };
   }
 
@@ -313,8 +332,10 @@ export default function PricingPage() {
   const { activePlan, billingStatus, billingTestMode, hasActivePayment } =
     useLoaderData();
   const actionData = useActionData();
+  const navigate = useNavigate();
   const navigation = useNavigation();
   const [searchParams, setSearchParams] = useSearchParams();
+  const processedBillingReturn = useRef(false);
   const interval = getSelectedInterval(searchParams);
   const submittingPlan =
     navigation.state === "submitting"
@@ -326,6 +347,15 @@ export default function PricingPage() {
     next.set("interval", nextInterval);
     setSearchParams(next);
   };
+
+  useEffect(() => {
+    if (!billingStatus?.redirectToApp || processedBillingReturn.current) {
+      return;
+    }
+
+    processedBillingReturn.current = true;
+    navigate("/app", { replace: true });
+  }, [billingStatus?.redirectToApp, navigate]);
 
   return (
     <>

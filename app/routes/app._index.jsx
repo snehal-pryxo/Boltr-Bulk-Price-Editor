@@ -19,14 +19,14 @@ import {
   DiscountIcon,
   ProductIcon,
 } from "@shopify/polaris-icons";
-import { TitleBar } from "@shopify/app-bridge-react";
+import { TitleBar, useAppBridge } from "@shopify/app-bridge-react";
 import {
   useLoaderData,
   useLocation,
   useNavigate,
   useNavigation,
 } from "@remix-run/react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
 import { withShopifyEmbeddedParams } from "../lib/shopify-embedded-url";
@@ -921,9 +921,11 @@ function HelpCard() {
 
 export default function AppIndex() {
   const { overviewStats, taskStats, saleStats } = useLoaderData();
+  const shopify = useAppBridge();
   const navigate = useNavigate();
   const location = useLocation();
   const navigation = useNavigation();
+  const billingToastShown = useRef(false);
   const nextPath = navigation.location?.pathname;
   const [pendingPath, setPendingPath] = useState("");
   const openingPath = nextPath || pendingPath;
@@ -933,6 +935,26 @@ export default function AppIndex() {
     setPendingPath(path);
     navigate(target);
   };
+
+  useEffect(() => {
+    const searchParams = new URLSearchParams(location.search);
+
+    if (
+      searchParams.get("billing_status") !== "free_plan_active" ||
+      billingToastShown.current
+    ) {
+      return;
+    }
+
+    billingToastShown.current = true;
+    shopify.toast.show("Free Plan is active.");
+    searchParams.delete("billing_status");
+    const nextSearch = searchParams.toString();
+
+    navigate(`${location.pathname}${nextSearch ? `?${nextSearch}` : ""}`, {
+      replace: true,
+    });
+  }, [location.pathname, location.search, navigate, shopify]);
 
   return (
     <>
