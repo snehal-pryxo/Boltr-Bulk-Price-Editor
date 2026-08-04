@@ -1,10 +1,17 @@
 import { json } from "@remix-run/node";
-import { Form, useLoaderData, useNavigation, useSearchParams } from "@remix-run/react";
+import {
+  Form,
+  useActionData,
+  useLoaderData,
+  useNavigation,
+  useSearchParams,
+} from "@remix-run/react";
 import { TitleBar } from "@shopify/app-bridge-react";
 import {
   Badge,
   BlockStack,
   Box,
+  Banner,
   Button,
   ButtonGroup,
   Card,
@@ -16,27 +23,84 @@ import {
 } from "@shopify/polaris";
 import { authenticate } from "../shopify.server";
 import { ALL_PRICING_PLAN_KEYS, PLAN_TIERS } from "../lib/pricing-plans";
+import db from "../db.server";
+
+const FREE_PLAN_NAME = "Free Plan";
+const BILLING_PLAN_SETTING_KEY = "billing.plan";
 
 export async function loader({ request }) {
-  const { billing } = await authenticate.admin(request);
+  const { billing, session } = await authenticate.admin(request);
+  const url = new URL(request.url);
   const billingTestMode = isBillingTestMode();
   const billingCheck = await billing.check({
     plans: ALL_PRICING_PLAN_KEYS,
     isTest: billingTestMode,
   });
   const activeSubscription = billingCheck.appSubscriptions?.[0] || null;
+  const activePlan = activeSubscription?.name || FREE_PLAN_NAME;
+
+  await saveBillingPlan(session.shop, activePlan);
+
+  const billingStatus = getBillingStatus({
+    hasBillingReturn: url.searchParams.get("billing_return") === "1",
+    hasActivePayment: Boolean(billingCheck.hasActivePayment),
+    activePlan,
+  });
 
   return json({
-    activePlan: activeSubscription?.name || "",
+    activePlan,
+    billingStatus,
     billingTestMode,
     hasActivePayment: Boolean(billingCheck.hasActivePayment),
   });
 }
 
+
 export async function action({ request }) {
   const { billing, session } = await authenticate.admin(request);
   const formData = await request.formData();
   const plan = String(formData.get("plan") || "");
+
+  if (plan === "free") {
+    try {
+      const billingCheck = await billing.check({
+        plans: ALL_PRICING_PLAN_KEYS,
+        isTest: isBillingTestMode(),
+      });
+
+      await Promise.all(
+        (billingCheck.appSubscriptions || []).map((subscription) =>
+          billing.cancel({
+            subscriptionId: subscription.id,
+            isTest: isBillingTestMode(),
+            prorate: true,
+          }),
+        ),
+      );
+
+      await saveBillingPlan(session.shop, FREE_PLAN_NAME);
+
+      return json({
+        ok: true,
+        message: "Free Plan is active.",
+        activePlan: FREE_PLAN_NAME,
+      });
+    } catch (error) {
+      console.error("Unable to activate free billing plan.", {
+        shop: session.shop,
+        error,
+      });
+
+      return json(
+        {
+          ok: false,
+          message:
+            "We could not activate the Free Plan. Please try again or contact support.",
+        },
+        { status: 500 },
+      );
+    }
+  }
 
   if (!ALL_PRICING_PLAN_KEYS.includes(plan)) {
     return json({ ok: false, message: "Invalid plan selected." }, { status: 400 });
@@ -44,11 +108,32 @@ export async function action({ request }) {
 
   const returnUrl = getBillingReturnUrl(session.shop);
 
-  return billing.request({
-    plan,
-    isTest: isBillingTestMode(),
-    returnUrl,
-  });
+  try {
+    return await billing.request({
+      plan,
+      isTest: isBillingTestMode(),
+      returnUrl,
+    });
+  } catch (error) {
+    if (error instanceof Response) {
+      throw error;
+    }
+
+    console.error("Unable to create Shopify app subscription.", {
+      shop: session.shop,
+      plan,
+      error,
+    });
+
+    return json(
+      {
+        ok: false,
+        message:
+          "Shopify could not open the billing approval page. Please try again.",
+      },
+      { status: 500 },
+    );
+  }
 }
 
 function isBillingTestMode() {
@@ -64,10 +149,57 @@ function getBillingReturnUrl(shop) {
   const appHandle = process.env.SHOPIFY_APP_HANDLE || "bulk-price-editor-boltr";
 
   if (storeHandle && appHandle) {
-    return `https://admin.shopify.com/store/${storeHandle}/apps/${appHandle}/app/`;
+    return `https://admin.shopify.com/store/${storeHandle}/apps/${appHandle}/app/billing?billing_return=1`;
   }
 
-  return new URL("/app", process.env.SHOPIFY_APP_URL || "https://app.local").toString();
+  const returnUrl = new URL(
+    "/app/billing",
+    process.env.SHOPIFY_APP_URL || "https://app.local",
+  );
+  returnUrl.searchParams.set("billing_return", "1");
+  return returnUrl.toString();
+}
+
+function getBillingStatus({ hasBillingReturn, hasActivePayment, activePlan }) {
+  if (!hasBillingReturn) {
+    return null;
+  }
+
+  if (hasActivePayment) {
+    return {
+      tone: "success",
+      message: `${activePlan} is active.`,
+    };
+  }
+
+  return {
+    tone: "warning",
+    message:
+      "Billing approval was not completed. You can choose a paid plan again when you are ready.",
+  };
+}
+
+async function saveBillingPlan(shop, plan) {
+  if (!shop || !plan) {
+    return null;
+  }
+
+  return db.priceEditorSetting.upsert({
+    where: {
+      shop_key: {
+        shop,
+        key: BILLING_PLAN_SETTING_KEY,
+      },
+    },
+    create: {
+      shop,
+      key: BILLING_PLAN_SETTING_KEY,
+      value: plan,
+    },
+    update: {
+      value: plan,
+    },
+  });
 }
 
 function getSelectedInterval(searchParams) {
@@ -78,8 +210,9 @@ function PlanCard({ plan, interval, activePlan, hasActivePayment, submittingPlan
   const planKey = interval === "yearly" ? plan.yearlyPlan : plan.monthlyPlan;
   const price = interval === "yearly" ? plan.yearlyPrice : plan.monthlyPrice;
   const intervalLabel = planKey ? (interval === "yearly" ? "/year" : "/month") : "";
+  const submittedPlanKey = planKey || "free";
   const isCurrent = planKey ? activePlan === planKey : !hasActivePayment;
-  const isLoading = submittingPlan === planKey;
+  const isLoading = submittingPlan === submittedPlanKey;
 
   return (
     <Card padding="0">
@@ -118,9 +251,18 @@ function PlanCard({ plan, interval, activePlan, hasActivePayment, submittingPlan
                 </Button>
               </Form>
             ) : (
-              <Button fullWidth disabled={isCurrent} variant="secondary">
-                {isCurrent ? "Current plan" : "Free plan"}
-              </Button>
+              <Form method="post">
+                <input type="hidden" name="plan" value="free" />
+                <Button
+                  submit
+                  fullWidth
+                  disabled={isCurrent || Boolean(submittingPlan)}
+                  loading={isLoading}
+                  variant="secondary"
+                >
+                  {isCurrent ? "Current plan" : "Free plan"}
+                </Button>
+              </Form>
             )}
           </BlockStack>
         </Box>
@@ -168,7 +310,9 @@ function Check({ children }) {
 }
 
 export default function PricingPage() {
-  const { activePlan, billingTestMode, hasActivePayment } = useLoaderData();
+  const { activePlan, billingStatus, billingTestMode, hasActivePayment } =
+    useLoaderData();
+  const actionData = useActionData();
   const navigation = useNavigation();
   const [searchParams, setSearchParams] = useSearchParams();
   const interval = getSelectedInterval(searchParams);
@@ -177,7 +321,7 @@ export default function PricingPage() {
       ? String(navigation.formData?.get("plan") || "")
       : "";
 
-  const setInterval = (nextInterval) => {
+  const updateBillingInterval = (nextInterval) => {
     const next = new URLSearchParams(searchParams);
     next.set("interval", nextInterval);
     setSearchParams(next);
@@ -190,6 +334,18 @@ export default function PricingPage() {
         <Layout>
           <Layout.Section>
             <BlockStack gap="600">
+              {billingStatus ? (
+                <Banner tone={billingStatus.tone}>
+                  <Text as="p">{billingStatus.message}</Text>
+                </Banner>
+              ) : null}
+
+              {actionData?.message ? (
+                <Banner tone={actionData.ok ? "success" : "critical"}>
+                  <Text as="p">{actionData.message}</Text>
+                </Banner>
+              ) : null}
+
               {billingTestMode ? (
                 <InlineStack align="center">
                   <Badge tone="attention">Shopify billing test mode</Badge>
@@ -200,13 +356,13 @@ export default function PricingPage() {
                 <ButtonGroup variant="segmented">
                   <Button
                     pressed={interval === "monthly"}
-                    onClick={() => setInterval("monthly")}
+                    onClick={() => updateBillingInterval("monthly")}
                   >
                     Monthly
                   </Button>
                   <Button
                     pressed={interval === "yearly"}
-                    onClick={() => setInterval("yearly")}
+                    onClick={() => updateBillingInterval("yearly")}
                   >
                     Yearly (2 months free)
                   </Button>
