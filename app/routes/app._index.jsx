@@ -474,8 +474,18 @@ function getBillingPlanSummary(savedPlan) {
 
   return {
     planName,
-    credits: activeTier.priceChangeLimit,
+    credits: getPlanCredits(activeTier.priceChangeLimit),
   };
+}
+
+function getPlanCredits(priceChangeLimit) {
+  const limit = String(priceChangeLimit || "");
+
+  if (limit.toLowerCase().includes("unlimited")) {
+    return "Unlimited";
+  }
+
+  return limit.match(/[\d,]+/)?.[0] || limit;
 }
 
 export const loader = async ({ request }) => {
@@ -1021,11 +1031,16 @@ export default function AppIndex() {
     <>
       <TitleBar title="Boltr Bulk Price Editor" />
 
-      <Page title="Dashboard">
+      <Page>
         <Layout>
           <Layout.Section>
             <Box paddingBlockEnd="400">
-              <BillingPlanSummary billingPlan={billingPlan} />
+              <InlineStack align="space-between" blockAlign="center" gap="400">
+                <Text as="h1" variant="headingLg">
+                  Dashboard
+                </Text>
+                <BillingPlanSummary billingPlan={billingPlan} />
+              </InlineStack>
             </Box>
             <Box paddingBlockEnd="00">
               <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="400">
