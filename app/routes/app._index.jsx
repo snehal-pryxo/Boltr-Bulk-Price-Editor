@@ -29,8 +29,12 @@ import {
 import { useEffect, useRef, useState } from "react";
 import db from "../db.server";
 import { authenticate } from "../shopify.server";
+import { PLAN_TIERS } from "../lib/pricing-plans";
 import { withShopifyEmbeddedParams } from "../lib/shopify-embedded-url";
 import { normalizeSaleStatus, SALE_STATUS } from "../lib/sale-status";
+
+const BILLING_PLAN_SETTING_KEY = "billing.plan";
+const FREE_PLAN_NAME = "Free Plan";
 
 const statsRowStyle = {
   display: "flex",
@@ -455,11 +459,31 @@ function buildOverviewStats(tasks, sales, taskAuditLogs, totalTaskChangesCount) 
   };
 }
 
+function getBillingPlanSummary(savedPlan) {
+  const activePlan = String(savedPlan || FREE_PLAN_NAME);
+  const activeTier =
+    PLAN_TIERS.find((tier) =>
+      [tier.name, tier.monthlyPlan, tier.yearlyPlan].includes(activePlan),
+    ) || PLAN_TIERS[0];
+  const interval = activePlan.endsWith("Yearly")
+    ? "Yearly"
+    : activePlan.endsWith("Monthly")
+      ? "Monthly"
+      : "";
+  const planName = interval ? `${activeTier.name} ${interval}` : activeTier.name;
+
+  return {
+    planName,
+    credits: activeTier.priceChangeLimit,
+  };
+}
+
 export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request);
   const { previousStart } = getPeriodBounds();
 
-  const [tasks, sales, taskAuditLogCount, taskAuditLogs] = await Promise.all([
+  const [tasks, sales, taskAuditLogCount, taskAuditLogs, billingPlanSetting] =
+    await Promise.all([
     db.task.findMany({
       where: { shop: session.shop },
       select: { status: true, executionSummary: true, createdAt: true },
@@ -479,12 +503,22 @@ export const loader = async ({ request }) => {
       },
       select: { createdAt: true },
     }),
+    db.priceEditorSetting.findUnique({
+      where: {
+        shop_key: {
+          shop: session.shop,
+          key: BILLING_PLAN_SETTING_KEY,
+        },
+      },
+      select: { value: true },
+    }),
   ]);
 
   return json({
     overviewStats: buildOverviewStats(tasks, sales, taskAuditLogs, taskAuditLogCount),
     taskStats: buildStats(taskStatDefinitions, tasks, taskMatchesStatus),
     saleStats: buildStats(saleStatDefinitions, sales, saleMatchesStatus),
+    billingPlan: getBillingPlanSummary(billingPlanSetting?.value),
   });
 };
 
@@ -526,6 +560,33 @@ function MetricCard({
     </Card>
       </div>
     </div>
+  );
+}
+
+function BillingPlanSummary({ billingPlan }) {
+  return (
+    <InlineStack align="end">
+      <Card>
+        <InlineStack gap="500" blockAlign="center" wrap={false}>
+          <BlockStack gap="050">
+            <Text as="span" variant="bodySm" tone="subdued">
+              Active plan
+            </Text>
+            <Text as="span" variant="headingMd">
+              {billingPlan.planName}
+            </Text>
+          </BlockStack>
+          <BlockStack gap="050">
+            <Text as="span" variant="bodySm" tone="subdued">
+              Total credits
+            </Text>
+            <Text as="span" variant="headingMd">
+              {billingPlan.credits}
+            </Text>
+          </BlockStack>
+        </InlineStack>
+      </Card>
+    </InlineStack>
   );
 }
 
@@ -920,7 +981,7 @@ function HelpCard() {
 }
 
 export default function AppIndex() {
-  const { overviewStats, taskStats, saleStats } = useLoaderData();
+  const { overviewStats, taskStats, saleStats, billingPlan } = useLoaderData();
   const shopify = useAppBridge();
   const navigate = useNavigate();
   const location = useLocation();
@@ -963,6 +1024,9 @@ export default function AppIndex() {
       <Page title="Dashboard">
         <Layout>
           <Layout.Section>
+            <Box paddingBlockEnd="400">
+              <BillingPlanSummary billingPlan={billingPlan} />
+            </Box>
             <Box paddingBlockEnd="00">
               <InlineGrid columns={{ xs: 1, sm: 2, md: 4 }} gap="400">
                 <MetricCard
